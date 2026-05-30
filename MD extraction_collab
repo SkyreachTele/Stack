@@ -1,172 +1,112 @@
-# 1. INSTALLATION (Including MinerU/Magic-PDF and dependencies)
-!pip install docling markitdown wordsegment magic-pdf[full] detectron2@git+https://github.com/facebookresearch/detectron2.git
-!pip install playwright
-!playwright install chromium
+# 1. Install dependencies
+!pip install -q docling pypdfium2 torch
 
 import os
-import re
-import json
-import datetime
-from google.colab import drive
-# docling and markitdown imports are still needed, but actual objects will be instantiated in workers.
+import gc
+import time
+import torch
+from pathlib import Path
+
+try:
+    from google.colab import drive
+except ImportError:
+    pass
+
 from docling.document_converter import DocumentConverter
-from markitdown import MarkItDown
-from wordsegment import load, segment
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.base_models import InputFormat
+from docling.document_converter import PdfFormatOption
+import pypdfium2 as pdfium
 
-import multiprocessing
-import shutil # Added for cleaning up temp directories
+# 2. Mount Google Drive
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive')
 
-# Initialize Lexical Data (globally, but also handled per worker to ensure robustness)
-load()
-drive.mount('/content/drive')
+# ── Configuration ─────────────────────────────────────────────────────
+parent_dir = Path("/content/drive/My Drive/Stock_Market/Indian Economic Survey")
+SKIP_FOLDERS = ["FY_2025", "FY_2026"]
+IGNORE_PATTERNS = (
+    "epreface", "hechap", "hepreface", "hechapter",
+    "infographics", "statistical-appendix-in-hindi", "tab"
+)
 
-# 2. MINERU SETUP (Crucial step I missed earlier)
-# MinerU needs a config file to run. We create a dummy one for the default CPU/GPU path.
-mineru_config = {
-    "device": "cpu", # Change to "cuda" if using Colab GPU
-    "model_path": "/content/magic-pdf-models"
-}
-with open("/root/magic-pdf.json", "w") as f:
-    json.dump(mineru_config, f)
+def should_skip(filename):
+    fname = filename.lower()
+    if any(p in fname for p in IGNORE_PATTERNS):
+        if "echapter" in fname: return False
+        return True
+    if "echap" in fname and "echapter" not in fname: return True
+    return False
 
-# Initialize Converters (these global instances won't be used by parallel workers' processing logic)
-docling_converter = DocumentConverter()
-markitdown_converter = MarkItDown()
+def make_converter():
+    opts = PdfPipelineOptions()
+    opts.do_ocr = True
+    opts.do_table_structure = True
+    # Use GPU for RapidOCR
+    opts.accelerator.device = "cuda" if torch.cuda.is_available() else "cpu"
+    return DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+    )
 
-# This function needs to be at the top level for multiprocessing to pickle it
-def aggressive_segmentation(text):
-    """Force-splits merged words to fix 'smushed' text."""
-    # Ensure wordsegment's dictionary is loaded for the worker, if not already.
-    from wordsegment import segment, load, default_dictionary
-    if default_dictionary is None:
-        load()
+converter = make_converter()
 
-    def fix_line(line):
-        words = line.split()
-        new_words = []
-        for w in words:
-            clean_w = re.sub(r'[^a-zA-Z]', '', w)
-            if len(clean_w) > 7 or (len(clean_w) > 1 and any(c.isupper() for c in clean_w[1:])):
-                new_words.append(" ".join(segment(clean_w)))
-            else:
-                new_words.append(w)
-        return " ".join(new_words)
-    return "\n".join([fix_line(l) for l in text.split('\n')])
+# ── Global Processing ──────────────────────────────────────
+if parent_dir.exists():
+    subfolders = sorted([d for d in parent_dir.iterdir() if d.is_dir()])
+    
+    for folder in subfolders:
+        if folder.name in SKIP_FOLDERS: continue
 
-# Function to initialize worker processes (e.g., load wordsegment's dictionary)
-def worker_init():
-    """Initializes resources for each worker process."""
-    from wordsegment import load
-    load() # Load dictionary for each worker process
+        master_filename = f"{folder.name}_master.md"
+        master_out = folder / master_filename
+        
+        # If master exists, skip session
+        if master_out.exists():
+            print(f"[SKIP SESSION] {folder.name} (Done)")
+            continue
 
-# This function will be executed by each worker process in the pool
-def process_single_file(file_path):
-    """Processes a single file to extract and clean content."""
-    # Converters must be instantiated within each worker process to avoid sharing issues
-    from docling.document_converter import DocumentConverter
-    from markitdown import MarkItDown
-    docling_converter_worker = DocumentConverter()
-    markitdown_converter_worker = MarkItDown()
+        pdf_files = sorted(list(folder.glob("*.pdf")))
+        if not pdf_files: continue
 
-    ext = file_path.lower().split('.')[-1]
-    raw = ""
-    processed_content = None
-    error_message = None
+        print(f"\n{'='*60}\nRUNNING SESSION: {folder.name}\n{'='*60}")
+        folder_markdown = []
 
-    try:
-        # ROUTING LOGIC INCLUDING MINERU
-        if ext == 'pdf':
-            print(f"  └─ MinerU Extracting: {os.path.basename(file_path)} (PID: {os.getpid()})")
+        for pdf_path in pdf_files:
+            filename = pdf_path.name
+            if should_skip(filename): continue
 
-            # Generate a unique temporary output directory for each process and file
-            file_identifier = os.path.basename(file_path).replace('.', '_')
-            temp_output_dir = os.path.join('/content/temp_miner_output', f"{file_identifier}_{os.getpid()}_{datetime.datetime.now().microsecond}")
-            os.makedirs(temp_output_dir, exist_ok=True)
+            # Internal Resume: Check if file already added to markdown list conceptually
+            # For simplicity, we process the whole folder at once into the master file
+            print(f"\n[START] {filename}")
+            folder_markdown.append(f"\n\n# SOURCE: {filename}\n")
 
             try:
-                # Using Magic-PDF command line via os for stability in Colab
-                os.system(f"magic-pdf -i '{file_path}' -o '{temp_output_dir}' -m json")
+                doc = pdfium.PdfDocument(str(pdf_path))
+                total_pages = len(doc)
+                doc.close()
 
-                miner_output_md = None
-                # MinerU often puts output in a subfolder. Search for the .md file.
-                for root_walk, _, files_walk in os.walk(temp_output_dir):
-                    for f_walk in files_walk:
-                        if f_walk.endswith('.md'):
-                            miner_output_md = os.path.join(root_walk, f_walk)
-                            break
-                    if miner_output_md:
-                        break
+                for pg in range(1, total_pages + 1):
+                    pg_start = time.time()
+                    print(f"  Page {pg}/{total_pages} ...", end="", flush=True)
 
-                if miner_output_md and os.path.exists(miner_output_md):
-                    with open(miner_output_md, 'r', encoding='utf-8') as f:
-                        raw = f.read()
-                else:
-                    print(f"  └─ MinerU did not produce expected MD for {os.path.basename(file_path)} (PID: {os.getpid()}). Falling back to Docling.")
-                    raw = docling_converter_worker.convert(file_path).document.export_to_markdown()
+                    result = converter.convert(str(pdf_path), page_range=(pg, pg))
+                    content = result.document.export_to_markdown()
+                    folder_markdown.append(content)
 
-            except Exception as e_miner:
-                print(f"  └─ MinerU failed for {os.path.basename(file_path)} (PID: {os.getpid()}): {e_miner}. Falling back to Docling.")
-                raw = docling_converter_worker.convert(file_path).document.export_to_markdown()
-            finally:
-                # Clean up temporary directory specific to this file and process
-                if os.path.exists(temp_output_dir):
-                    shutil.rmtree(temp_output_dir)
+                    elapsed = time.time() - pg_start
+                    print(f" [{elapsed:.1f}s] ✓", end=" ")
 
-        elif ext in ['docx', 'pptx', 'xlsx', 'csv', 'jpg', 'png']:
-            raw = markitdown_converter_worker.convert(file_path).text_content
+                    gc.collect()
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-        # AGGRESSIVE CLEANUP
-        cleaned = aggressive_segmentation(raw)
-        processed_content = f"\n--- SOURCE: {os.path.basename(file_path)} ---\n{cleaned}"
+                print(f"\n[COMPLETED] {filename}")
+            except Exception as e:
+                print(f"\n[ERROR] {filename}: {e}")
 
-    except Exception as e:
-        error_message = f"  ❌ Failed {os.path.basename(file_path)} (PID: {os.getpid()}): {e}"
+        if folder_markdown:
+            master_out.write_text("\n".join(folder_markdown), encoding="utf-8")
+            print(f"\n[FINISHED SESSION] {folder.name}. Saved to: {master_out}")
 
-    return processed_content, error_message, file_path
-
-def run_integrated_pipeline_parallel(root_path, num_processes=None):
-    """
-    Runs the integrated file processing pipeline with parallel execution for files
-    within each subfolder. num_processes=None uses os.cpu_count().
-    """
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-
-    # Create a base directory for all temporary MinerU outputs, to be cleaned up after all processing
-    base_temp_miner_output_dir = '/content/temp_miner_output'
-    os.makedirs(base_temp_miner_output_dir, exist_ok=True)
-
-    try:
-        # Initialize a multiprocessing Pool with an initializer for worker setup
-        with multiprocessing.Pool(processes=num_processes, initializer=worker_init) as pool:
-            for root, dirs, files in os.walk(root_path):
-                files_to_process_paths = [os.path.join(root, f) for f in files if not f.endswith('.md')]
-                if not files_to_process_paths: continue
-
-                subfolder_name = os.path.basename(root)
-                output_path = os.path.join(root, f"{subfolder_name}_consolidated_{timestamp}.md")
-
-                batch_content = [f"# FOLDER: {subfolder_name}\n# GENERATED: {timestamp}\n"]
-
-                print(f"Processing folder: {subfolder_name} with {len(files_to_process_paths)} files in parallel...")
-
-                # Use pool.map to process files in parallel.
-                # map preserves the order of results corresponding to the input iterable.
-                results = pool.map(process_single_file, files_to_process_paths)
-
-                for processed_content, error_message, original_file_path in results:
-                    if processed_content:
-                        batch_content.append(processed_content)
-                    elif error_message:
-                        print(error_message) # Print errors that occurred during processing
-
-                if len(batch_content) > 1: # Only write if actual content was processed beyond the header
-                    with open(output_path, 'w', encoding='utf-8') as f:
-                        f.writelines(batch_content)
-                    print(f"✅ Consolidated: {subfolder_name}")
-    finally:
-        # Ensure the base temporary MinerU output directory is cleaned up after all tasks are done
-        if os.path.exists(base_temp_miner_output_dir):
-            shutil.rmtree(base_temp_miner_output_dir)
-
-# Call the parallel pipeline
-run_integrated_pipeline_parallel('/content/drive/MyDrive/Stock_Market/Indian Economic Survey')
+    print(f"\n{'#'*60}\nALL SESSIONS PROCESSED\n{'#'*60}")
+else:
+    print(f"Error: Path {parent_dir} not found.")
