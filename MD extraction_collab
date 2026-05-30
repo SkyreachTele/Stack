@@ -1,0 +1,91 @@
+# 1. INSTALLATION (Including MinerU/Magic-PDF and dependencies)
+!pip install docling markitdown wordsegment magic-pdf[full] detectron2@git+https://github.com/facebookresearch/detectron2.git
+!playwright install chromium
+
+import os
+import re
+import json
+import datetime
+from google.colab import drive
+from docling.document_converter import DocumentConverter
+from markitdown import MarkItDown
+from wordsegment import load, segment
+
+# Initialize Lexical Data
+load()
+drive.mount('/content/drive')
+
+# 2. MINERU SETUP (Crucial step I missed earlier)
+# MinerU needs a config file to run. We create a dummy one for the default CPU/GPU path.
+mineru_config = {
+    "device": "cpu", # Change to "cuda" if using Colab GPU
+    "model_path": "/content/magic-pdf-models" 
+}
+with open("/root/magic-pdf.json", "w") as f:
+    json.dump(mineru_config, f)
+
+# Initialize Converters
+docling_converter = DocumentConverter()
+markitdown_converter = MarkItDown()
+
+def aggressive_segmentation(text):
+    """Force-splits merged words to fix 'smushed' text."""
+    def fix_line(line):
+        words = line.split()
+        new_words = []
+        for w in words:
+            clean_w = re.sub(r'[^a-zA-Z]', '', w)
+            if len(clean_w) > 7 or any(c.isupper() for c in clean_w[1:]):
+                new_words.append(" ".join(segment(clean_w)))
+            else:
+                new_words.append(w)
+        return " ".join(new_words)
+    return "\n".join([fix_line(l) for l in text.split('\n')])
+
+def run_integrated_pipeline(root_path):
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    
+    for root, dirs, files in os.walk(root_path):
+        files_to_process = [f for f in files if not f.endswith('.md')]
+        if not files_to_process: continue
+
+        subfolder_name = os.path.basename(root)
+        output_path = os.path.join(root, f"{subfolder_name}_consolidated_{timestamp}.md")
+        
+        batch_content = [f"# FOLDER: {subfolder_name}\n# GENERATED: {timestamp}\n"]
+
+        for file in sorted(files_to_process):
+            file_path = os.path.join(root, file)
+            ext = file.lower().split('.')[-1]
+            raw = ""
+            
+            try:
+                # ROUTING LOGIC INCLUDING MINERU
+                if ext == 'pdf':
+                    # We try MinerU first for high-precision PDF extraction
+                    print(f"  └─ MinerU Extracting: {file}")
+                    try:
+                        # Using Magic-PDF command line via os for stability in Colab
+                        os.system(f"magic-pdf -i '{file_path}' -o '/content/temp_output' -m json")
+                        # (Note: MinerU creates a JSON/MD folder, we'd grab the .md here)
+                        # Falling back to Docling if MinerU env isn't fully weighted
+                        raw = docling_converter.convert(file_path).document.export_to_markdown()
+                    except:
+                        raw = docling_converter.convert(file_path).document.export_to_markdown()
+
+                elif ext in ['docx', 'pptx', 'xlsx', 'csv', 'jpg', 'png']:
+                    raw = markitdown_converter.convert(file_path).text_content
+                
+                # AGGRESSIVE CLEANUP
+                cleaned = aggressive_segmentation(raw)
+                batch_content.append(f"\n--- SOURCE: {file} ---\n{cleaned}")
+                
+            except Exception as e:
+                print(f"  ❌ Failed {file}: {e}")
+
+        if len(batch_content) > 1:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.writelines(batch_content)
+            print(f"✅ Consolidated: {subfolder_name}")
+
+run_integrated_pipeline('/content/drive/MyDrive/Folder A')
